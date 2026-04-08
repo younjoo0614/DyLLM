@@ -17,6 +17,7 @@ class Config:
     mask_id: int = -1
     num_full_steps: int = 8
     threshold: float = 0.99
+    dist_port: int | None = None
     
     def __post_init__(self):
         assert os.path.isdir(self.model)

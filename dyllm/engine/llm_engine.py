@@ -7,6 +7,7 @@ from time import perf_counter_ns
 import threading
 import queue
 import time
+import socket
 
 from dyllm.config import Config
 from dyllm.engine.model_runner import ModelRunner
@@ -19,6 +20,13 @@ from dyllm.utils.metadata import set_metadata, get_metadata
 class DLLMEngine:
     def __init__(self, model, threshold, **kwargs):
         config = Config(model)
+        env_dist_port = os.environ.get("DYLLM_DIST_PORT")
+        if env_dist_port is not None:
+            config.dist_port = int(env_dist_port)
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                config.dist_port = s.getsockname()[1]
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         ctx = mp.get_context("spawn")
         self.ps = []
@@ -229,7 +237,7 @@ class DLLMEngine:
                 outputs[seq_id] = token_ids
         end = time.perf_counter_ns()
 
-        print(f"Total generation time: {(end - start) / 1e9:.2f} s")
+        # print(f"Total generation time: {(end - start) / 1e9:.2f} s")
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         if len(token_ids[-sampling_params[0].max_new_tokens :]) == 0:

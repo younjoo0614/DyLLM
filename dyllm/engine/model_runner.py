@@ -26,10 +26,9 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        # Initialize distributed process group
-        import time
-
-        port = 1000 + int(time.time()) % 1000
+        # Initialize distributed process group.
+        # Prefer per-engine allocated port from config to avoid overlap across runs.
+        port = config.dist_port if config.dist_port is not None else int(os.environ.get("DYLLM_DIST_PORT", "29500"))
         dist.init_process_group(
             backend="nccl", init_method=f"tcp://localhost:{port}", world_size=self.world_size, rank=rank
         )
