@@ -168,28 +168,32 @@ class ModelRunner:
             seqlen = len(seq)
             seqlen_q = seq.max_new_tokens
             cu_promptlens.append(seq.num_prompt_tokens + cu_promptlens[-1])
+            answer_start = seqlen - seq.max_new_tokens
+            kept = [
+                (p, t)
+                for p, t in zip(seq.last_token_pos, seq.last_tokens)
+                if p >= answer_start
+            ]
+            kept_pos = [p for p, _ in kept]
+            kept_count = len(kept_pos)
             if seq.processed_steps > 4 and seq.processed_steps % 4 != 0:
                 input_ids.extend(seq[-seq.max_new_tokens :])
                 positions.extend(list(range(seqlen - seq.max_new_tokens, seqlen)))
                 idx_salient_rows.extend(
-                    [
-                        i - seq.num_prompt_tokens + cu_seqlens_q[-1]
-                        for i in seq.last_token_pos
-                        if i >= seqlen - seq.max_new_tokens
-                    ]
+                    [i - seq.num_prompt_tokens + cu_seqlens_q[-1] for i in kept_pos]
                 )
-                idx_salient_rows_k.extend([i + cu_seqlens_k[-1] for i in seq.last_token_pos])
+                idx_salient_rows_k.extend([i + cu_seqlens_k[-1] for i in kept_pos])
                 seqlen_q = seq.max_new_tokens
             else:
                 input_ids.extend(seq)
                 positions.extend(list(range(seqlen)))
-                idx_salient_rows.extend([i + cu_seqlens_q[-1] for i in seq.last_token_pos])
+                idx_salient_rows.extend([i + cu_seqlens_q[-1] for i in kept_pos])
                 idx_salient_rows_k = None
                 seqlen_q = seqlen
-            positions_k.extend([i for i in seq.last_token_pos])
-            idx_updated_rows.extend([i + cu_seqlens_k[-1] for i in seq.last_token_pos])
-            cu_updatedlens.append(len(seq.last_tokens) + cu_updatedlens[-1])
-            cu_salientlens.append(len(seq.last_tokens) + cu_salientlens[-1])
+            positions_k.extend(kept_pos)
+            idx_updated_rows.extend([i + cu_seqlens_k[-1] for i in kept_pos])
+            cu_updatedlens.append(kept_count + cu_updatedlens[-1])
+            cu_salientlens.append(kept_count + cu_salientlens[-1])
             seq_ids.append(seq.seq_id)
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -266,9 +270,11 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]):
         mask_id = self.config.mask_id
         rels, counts, temps, transfers = [], [], [], []
-        top_ps, top_ks, thrs = [], [], []
+        top_ps, top_ks = [], []
+        conf_thrs = []
         batch_offsets = []
-        has_p = has_k = has_thr = False
+        has_p = has_k = False
+        has_conf_thr = False
 
         is_sparse_k = get_context().idx_salient_row_k is not None
 
@@ -289,16 +295,15 @@ class ModelRunner:
                 if seq.temperature is not None and seq.temperature > 1e-6
                 else temps.extend([None] * len(mask_pos))
             )
-            transfers.append(seq.num_transfer_tokens)
+            transfers.append(1 if seq.confidence_threshold is not None else seq.num_transfer_tokens)
             p_val = seq.top_p if seq.top_p is not None else None
             top_ps.extend([p_val] * len(mask_pos))
             k_val = seq.top_k if seq.top_k is not None else None
             top_ks.extend([k_val] * len(mask_pos))
-            t_val = seq.threshold if seq.threshold is not None else None
-            thrs.extend([t_val] * len(mask_pos))
+            conf_thrs.append(seq.confidence_threshold if seq.confidence_threshold is not None else float("inf"))
             has_p |= seq.top_p is not None
             has_k |= seq.top_k is not None
-            has_thr |= seq.threshold is not None
+            has_conf_thr |= seq.confidence_threshold is not None
 
         block_size = max([seq.block_size if seq.block_size is not None else seq.max_new_tokens for seq in seqs])
 
@@ -315,7 +320,9 @@ class ModelRunner:
         transfers_cpu = torch.tensor(transfers, dtype=torch.int32, device="cpu").pin_memory()
         p_cpu = torch.tensor(top_ps, dtype=torch.float32, device="cpu").pin_memory() if has_p else None
         k_cpu = torch.tensor(top_ks, dtype=torch.int32, device="cpu").pin_memory() if has_k else None
-        thr_cpu = torch.tensor(thrs, dtype=torch.float32, device="cpu").pin_memory() if has_thr else None
+        conf_thr_cpu = (
+            torch.tensor(conf_thrs, dtype=torch.float32, device="cpu").pin_memory() if has_conf_thr else None
+        )
 
         rels_cpu = torch.tensor(rels, dtype=torch.long, device="cpu").pin_memory()
         offsets_cpu = torch.tensor(batch_offsets, dtype=torch.long, device="cpu").pin_memory()
@@ -325,13 +332,15 @@ class ModelRunner:
         num_transfer_tokens = transfers_cpu.to(device="cuda", non_blocking=True)
         top_p = p_cpu.to(device="cuda", non_blocking=True) if p_cpu is not None else None
         top_k = k_cpu.to(device="cuda", non_blocking=True) if k_cpu is not None else None
-        thresholds = thr_cpu.to(device="cuda", non_blocking=True) if thr_cpu is not None else None
+        confidence_thresholds = (
+            conf_thr_cpu.to(device="cuda", non_blocking=True) if conf_thr_cpu is not None else None
+        )
 
         rel = rels_cpu.to(device="cuda", non_blocking=True)
         batch_offsets_gpu = offsets_cpu.to(device="cuda", non_blocking=True)
 
         return (
-            (temperatures, thresholds, top_k, top_p, block_size),
+            (temperatures, top_k, top_p, block_size, confidence_thresholds),
             (rel, batch_offsets_gpu, cu_filtered),
             num_transfer_tokens,
         )
@@ -362,12 +371,12 @@ class ModelRunner:
                 input_logits=logits,
                 ctx=get_context(),
                 input_indices=input_indices,
+                confidence_thresholds=sampler_params[4],
                 temperatures=sampler_params[0],
                 num_transfer=num_transfer_tokens,
-                thresholds=sampler_params[1],
-                top_k=sampler_params[2],
-                top_p=sampler_params[3],
-                block_size=sampler_params[4],
+                top_k=sampler_params[1],
+                top_p=sampler_params[2],
+                block_size=sampler_params[3],
             )
         else:
             pos, token_ids, counts = None, None, None

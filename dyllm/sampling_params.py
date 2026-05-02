@@ -12,5 +12,5 @@ class SamplingParams:
     algorithm: str = "confidence"
     top_p: float = None
     top_k: int = None
-    threshold: float = None
+    confidence_threshold: float = None
     input_len: int = None

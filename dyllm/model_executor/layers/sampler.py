@@ -45,8 +45,8 @@ def filter_and_count_kernel(
     scores_ptr,
     tokens_ptr,
     pos_ptr,
-    k_values_ptr,
-    thresholds_ptr,
+    num_transfer_ptr,
+    conf_thr_ptr,
     out_tokens_ptr,
     out_pos_ptr,
     out_counts_ptr,
@@ -58,8 +58,8 @@ def filter_and_count_kernel(
 ):
     pid = tl.program_id(0)
 
-    k_val = tl.load(k_values_ptr + pid)
-    thr_val = tl.load(thresholds_ptr + pid)
+    num_transfer_val = tl.load(num_transfer_ptr + pid)
+    conf_thr_val = tl.load(conf_thr_ptr + pid)
 
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < Max_Len
@@ -69,11 +69,11 @@ def filter_and_count_kernel(
     t_val = tl.load(tokens_ptr + row_start + offs, mask=mask, other=0)
     p_val = tl.load(pos_ptr + row_start + offs, mask=mask, other=0)
 
-    is_rank_valid = offs < k_val
-    is_score_valid = s_val >= thr_val
+    is_top_k = offs < num_transfer_val
+    is_above_conf = s_val >= conf_thr_val
     is_data_valid = s_val > float("-inf")
 
-    keep = is_rank_valid & is_score_valid & is_data_valid
+    keep = (is_top_k | is_above_conf) & is_data_valid
 
     t_out = tl.where(keep, t_val, -1)
     p_out = tl.where(keep, p_val, 0)
@@ -85,7 +85,7 @@ def filter_and_count_kernel(
     tl.store(out_counts_ptr + pid, count)
 
 
-def launch_filter_and_count(dense_scores, dense_tokens, dense_pos, k_values, thresholds, B, Max_Len):
+def launch_filter_and_count(dense_scores, dense_tokens, dense_pos, num_transfer, conf_thr, B, Max_Len):
     out_tokens = torch.empty_like(dense_tokens)
     out_pos = torch.empty_like(dense_pos)
     out_counts = torch.empty((B,), dtype=torch.int32, device=dense_scores.device)
@@ -97,8 +97,8 @@ def launch_filter_and_count(dense_scores, dense_tokens, dense_pos, k_values, thr
         dense_scores,
         dense_tokens,
         dense_pos,
-        k_values,
-        thresholds,
+        num_transfer,
+        conf_thr,
         out_tokens,
         out_pos,
         out_counts,
@@ -248,10 +248,10 @@ class BaseSampler(nn.Module):
         input_indices: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         temperatures: Optional[torch.Tensor] = None,
         num_transfer: Optional[torch.Tensor] = None,
-        thresholds: Optional[torch.Tensor] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         block_size: int = 32,
+        confidence_thresholds: Optional[torch.Tensor] = None,
     ):
         logits = self.adjust_logits(input_logits)
         device = logits.device
@@ -268,9 +268,9 @@ class BaseSampler(nn.Module):
         triton_repeat_interleave(cu_filtered, total_tokens, out_tensor=group_ids)
 
         if num_transfer is not None:
-            k_values = num_transfer.flatten().clamp_min_(0).to(device)
+            num_transfer_per_seq = num_transfer.flatten().clamp_min_(0).to(device)
         else:
-            k_values = torch.zeros(B, device=device, dtype=torch.long)
+            num_transfer_per_seq = torch.zeros(B, device=device, dtype=torch.long)
 
         base_offsets_flat = base_offsets.index_select(0, group_ids)
         global_rows = base_offsets_flat + local_idx
@@ -303,11 +303,13 @@ class BaseSampler(nn.Module):
         sorted_tokens = torch.gather(dense_tokens, 1, sorted_indices)
         sorted_pos = torch.gather(dense_pos, 1, sorted_indices)
 
-        if thresholds is None:
-            thresholds = torch.full((B,), float("-inf"), device=device)
+        if confidence_thresholds is None:
+            conf_thr = torch.full((B,), float("inf"), device=device, dtype=sorted_scores.dtype)
+        else:
+            conf_thr = confidence_thresholds.to(sorted_scores.dtype)
 
         out_pos, out_tokens, out_counts = launch_filter_and_count(
-            sorted_scores, sorted_tokens, sorted_pos, k_values, thresholds, B, block_size
+            sorted_scores, sorted_tokens, sorted_pos, num_transfer_per_seq, conf_thr, B, block_size
         )
 
         return out_pos, out_tokens, out_counts

@@ -99,7 +99,7 @@ class Scheduler:
 
         packed_cpu = packed_gpu.cpu()
         packed_list = packed_cpu.tolist()
-        cpu_counts = packed_list[:B]
+        num_unmasked_per_seq = packed_list[:B]
 
         tokens_start = B
         tokens_end = B + (B * L)
@@ -107,32 +107,31 @@ class Scheduler:
         flat_pos = packed_list[tokens_end:]
 
         for b, seq in enumerate(seqs):
-            count = cpu_counts[b]
-            if count == 0:
-                continue
+            num_unmasked = num_unmasked_per_seq[b]
+            if num_unmasked > 0:
+                start_idx = b * L
+                end_idx = start_idx + num_unmasked
+                tok_slice = flat_tokens[start_idx:end_idx]
+                pos_slice = flat_pos[start_idx:end_idx]
+                seq.update_token(pos_slice, tok_slice)
+                seq.update_block_idx()
 
-            start_idx = b * L
-            end_idx = start_idx + count
-            tok_slice = flat_tokens[start_idx:end_idx]
-            pos_slice = flat_pos[start_idx:end_idx]
-            seq.update_token(pos_slice, tok_slice)
-            seq.update_block_idx()
+                if self.eos in tok_slice:
+                    eos_idx = tok_slice.index(self.eos)
+                    eos_pos = pos_slice[eos_idx]
+                    if self.eos_and_done(seq, eos_pos) and not seq.ignore_eos:
+                        seq.status = SequenceStatus.FINISHED
+                        finished.append(seq.seq_id)
+                        if seq.processed_steps < seq.num_full_steps:
+                            if seq in self.full:
+                                self.full.remove(seq)
+                        else:
+                            if seq in self.sparse:
+                                self.sparse.remove(seq)
+                        continue
 
-            if self.eos in tok_slice:
-                eos_idx = tok_slice.index(self.eos)
-                eos_pos = pos_slice[eos_idx]
-                if self.eos_and_done(seq, eos_pos) and not seq.ignore_eos:
-                    seq.status = SequenceStatus.FINISHED
-                    finished.append(seq.seq_id)
-                    if seq.processed_steps < seq.num_full_steps:
-                        if seq in self.full:
-                            self.full.remove(seq)
-                    else:
-                        if seq in self.sparse:
-                            self.sparse.remove(seq)
-                    continue
-
-            if seq.processed_steps == seq.num_steps:
+            steps_done = seq.confidence_threshold is None and seq.processed_steps == seq.num_steps
+            if steps_done or seq.num_completion_tokens >= seq.max_new_tokens:
                 seq.status = SequenceStatus.FINISHED
                 finished.append(seq.seq_id)
                 if seq.processed_steps < seq.num_full_steps:

@@ -34,7 +34,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.top_p = sampling_params.top_p
         self.top_k = sampling_params.top_k
-        self.threshold = sampling_params.threshold
+        self.confidence_threshold = sampling_params.confidence_threshold
 
         self.block_size = sampling_params.block_size
         self.block_idx = 0
