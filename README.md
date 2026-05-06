@@ -40,3 +40,17 @@ DyLLM basically picks salient tokens from the response tokens and attends the wh
 bash ./scripts/run_gsm8k_acc_llada.sh # accuracy test
 bash ./scripts/run_gsm8k_llada.sh # throughput test
 ```
+
+## Citation
+
+If you find our code useful, please cite our paper.
+
+```bibtex
+@inproceedings{dyllm2026,
+    title={Dy{LLM}: Efficient Diffusion {LLM} inference via saliency-based token selection and partial attention},
+    author={Younjoo Lee and Seungkyun Dan and Junghoo Lee and Jaiyoung Park and {Jung Ho} Ahn},
+    booktitle={Forty-third International Conference on Machine Learning},
+    year={2026},
+    url={https://openreview.net/forum?id=0azUrmsSyA}
+}
+```
