@@ -7,6 +7,7 @@ class SamplingParams:
     max_new_tokens: int = 256
     steps: int = 64
     num_full_steps: int = 16
+    refresh_interval: int = 0
     block_size: int = 32
     ignore_eos: bool = False
     algorithm: str = "confidence"

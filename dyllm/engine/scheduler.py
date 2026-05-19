@@ -71,8 +71,15 @@ class Scheduler:
             seen.append(seq.seq_id)
 
         assert scheduled_seqs
+        # refresh_interval: force a full step every N sparse steps to refresh KV cache.
+        is_full = False
+        for seq in scheduled_seqs:
+            ri = seq.refresh_interval
+            if ri > 0 and (seq.processed_steps - seq.num_full_steps) % ri == 0:
+                is_full = True
+                break
         self.sparse.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, is_full
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.FULL
