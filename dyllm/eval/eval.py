@@ -45,6 +45,12 @@ def main():
     ap.add_argument("--ignore-eos", action="store_true", default=False)
     ap.add_argument("--num-steps", type=int, default=256)
     ap.add_argument("--num-full-steps", type=int, default=8)
+    ap.add_argument(
+        "--refresh-interval",
+        type=int,
+        default=0,
+        help="Force a full step every N sparse steps (0 disables; refresh path).",
+    )
     ap.add_argument("--block-size", type=int, default=32)
     ap.add_argument("--threshold", type=float, default=0.99)
     ap.add_argument("--trust-remote-code", action="store_true", default=True)
@@ -100,6 +106,7 @@ def main():
         "trust_remote_code": args.trust_remote_code,
         "num_steps": args.num_steps,
         "num_full_steps": args.num_full_steps,
+        "refresh_interval": args.refresh_interval,
         "block_size": args.block_size,
         "threshold": args.threshold,
     }

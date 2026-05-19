@@ -21,6 +21,30 @@ def _cut_on_first_stop(text: str, stops: list[str]) -> str:
     return text[:cut]
 
 
+_FENCE_CLOSED = re.compile(r"```(?:python|py)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+_FENCE_OPEN = re.compile(r"```(?:python|py)?[ \t]*\r?\n(.*)\Z", re.DOTALL)
+
+
+def _extract_code_from_markdown(text: str) -> str:
+    """Pull code out of the first ```python fence in the model output.
+
+    Instruct models on coding tasks emit fenced code; lm-eval pass@1 metrics
+    expect raw code that compiles when concatenated to the prompt. Falls back
+    to the original text when no fence is present.
+    """
+    m = _FENCE_CLOSED.search(text)
+    if m:
+        return m.group(1)
+    m = _FENCE_OPEN.search(text)
+    if m:
+        return m.group(1)
+    return text
+
+
+def _is_code_task(task_name: str) -> bool:
+    return task_name.startswith("humaneval") or task_name.startswith("mbpp")
+
+
 @register_model("dyllm")
 class DyLLMAdapter(LM):
     """
@@ -39,6 +63,7 @@ class DyLLMAdapter(LM):
         trust_remote_code: bool = True,
         num_steps: int = 256,
         num_full_steps: int = 16,
+        refresh_interval: int = 0,
         block_size: int = 32,
         threshold: float = 0.99,
         **kwargs,
@@ -57,6 +82,7 @@ class DyLLMAdapter(LM):
         self.ignore_eos = ignore_eos
         self.num_steps = int(num_steps)
         self.num_full_steps = int(num_full_steps)
+        self.refresh_interval = int(refresh_interval)
         self.block_size = int(block_size)
         self.threshold = float(threshold)
         trust_remote_code = trust_remote_code
@@ -160,6 +186,7 @@ class DyLLMAdapter(LM):
                 top_p=self.top_p,
                 steps=self.num_steps,
                 num_full_steps=self.num_full_steps,
+                refresh_interval=self.refresh_interval,
                 block_size=self.block_size,
                 ignore_eos=self.ignore_eos,
             )
@@ -173,12 +200,22 @@ class DyLLMAdapter(LM):
                 stops = inst.args[1].get("until", [])
                 doc = getattr(inst, "doc", {})
                 task_id = str(doc.get("task_id", "")).lower() if doc else ""
+                task_name = getattr(inst, "task_name", "") or ""
 
                 if self.is_instruct and task_id.startswith("humaneval"):
                     stops = []
-                all_stops = stops + ["<|eot_id|>", "<|endoftext|>", "</s>"]
+                # `<|role_end|>` is the LLaDA-MoE chat-template turn terminator;
+                # without it as a stop, the model keeps generating after the
+                # intended response and downstream extraction breaks.
+                all_stops = stops + ["<|eot_id|>", "<|endoftext|>", "</s>", "<|role_end|>"]
 
-                trimmed = _cut_on_first_stop(o["text"], all_stops).strip()
+                text = o["text"]
+                # Instruct models on code tasks emit ```python fences; strip
+                # them so lm_eval's pass@1 sees compilable code.
+                if self.is_instruct and _is_code_task(task_name):
+                    text = _extract_code_from_markdown(text)
+
+                trimmed = _cut_on_first_stop(text, all_stops).strip()
                 results.append(trimmed)
                 # print(f"Prompt: {inst.args[0]}\nGenerated: {trimmed}\n")
             print(f"time for batch {i // self._batch_size + 1}: {(end_time - start_time) / 1e9:.2f} seconds")
