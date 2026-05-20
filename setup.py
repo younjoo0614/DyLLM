@@ -9,7 +9,7 @@ from torch.utils.cpp_extension import (
 
 
 def get_arch_flags():
-    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0 8.6 8.9 9.0")
+    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0 8.6 8.9 9.0 10.0")
     flags = []
     for arch in arch_list.split():
         flags += [f"-gencode=arch=compute_{arch.replace('.', '')},code=sm_{arch.replace('.', '')}"]
