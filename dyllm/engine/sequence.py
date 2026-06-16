@@ -25,6 +25,8 @@ class Sequence:
         self.salient_ids = []
         self.output_length = sampling_params.max_new_tokens
         self.num_full_steps = sampling_params.num_full_steps
+        # When > 0, force a full step every `refresh_interval` sparse steps.
+        self.refresh_interval = sampling_params.refresh_interval
         self.num_steps = sampling_params.steps
         self.processed_steps = 0
         self.num_prompt_tokens = sum(1 for t in token_ids if t != self.mask_id)

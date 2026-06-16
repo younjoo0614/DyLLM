@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from dyllm.configs.llada_moe import LLaDAMoEConfig  # noqa: F401 (registers AutoConfig side effect)
+
 
 @dataclass
 class Config:
@@ -23,7 +25,15 @@ class Config:
         assert os.path.isdir(self.model)
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
-        self.mask_id = self.hf_config.mask_token_id
+        if getattr(self.hf_config, "model_type", None) == "llada_moe":
+            # LLaDA-MoE ships mask as a special token (<|mask|>) rather than via
+            # `mask_token_id`; resolve via the tokenizer.
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(self.model, trust_remote_code=True)
+            self.mask_id = tokenizer.convert_tokens_to_ids("<|mask|>")
+        else:
+            self.mask_id = self.hf_config.mask_token_id
         if hasattr(self.hf_config, "max_position_embeddings"):
             max_context_length = self.hf_config.max_position_embeddings
         elif hasattr(self.hf_config, "max_sequence_length"):
