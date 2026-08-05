@@ -6,7 +6,7 @@ void attention_sparse_varlen(const scalar_t* q, const scalar_t* k, const scalar_
                              const int* cu_seqlens_q, const int* cu_seqlens_k, const int max_seqlen_q,
                              const int max_seqlen_k, const int total_seqlen_q, const int num_salient,
                              const int* cu_salientlens, const int* idx_salient_row_k, const int* idx_salient_row_q,
-                             bool* block_mask, int* idx_map_k, int* idx_map_q, float* cosine_stats, bool* cosine_out,
+                             uint64_t* row_masks, int* idx_map_k, int* idx_map_q, float* cosine_stats, bool* cosine_out,
                              float threshold, int dim);
 
 at::Tensor attention_sparse_varlen_cuda(const at::Tensor& Q, // [T_q, H, D], bf16, CUDA
@@ -43,18 +43,14 @@ at::Tensor attention_sparse_varlen_cuda(const at::Tensor& Q, // [T_q, H, D], bf1
   constexpr int BLOCK_Q = 64; // Must match BLOCK_Q in attention_ops_kernels.cu
   constexpr int BLOCK_K = 64; // Must match BLOCK_KV in attention_ops_kernels.cu
   int block_kv = (max_seqlen_k + BLOCK_K - 1) / BLOCK_K;
-  int block_q = (max_seqlen_q + BLOCK_Q - 1) / BLOCK_Q;
 
   auto opts_gpu = at::TensorOptions().device(at::kCUDA);
-  auto block_mask = at::empty({B * block_kv}, opts_gpu.dtype(at::kBool));
-  auto idx_map_k = at::full({B * block_kv * BLOCK_K}, -1, opts_gpu.dtype(at::kInt));
+  auto row_masks = at::empty({B * block_kv}, opts_gpu.dtype(at::kLong));
 
-  // Always allocate idx_map_q - it's used for O_sal indexing in both pruned and non-pruned cases
-  auto idx_map_q = at::full({B * block_q * BLOCK_Q}, -1, opts_gpu.dtype(at::kInt));
-  int* idx_map_q_ptr = idx_map_q.data_ptr<int>();
+  int* idx_map_q_ptr = nullptr; // Salient Q rows are handled by a compact post-kernel.
 
-  bool* block_mask_ptr = block_mask.data_ptr<bool>();
-  int* idx_map_k_ptr = idx_map_k.data_ptr<int>();
+  uint64_t* row_masks_ptr = reinterpret_cast<uint64_t*>(row_masks.data_ptr<int64_t>());
+  int* idx_map_k_ptr = nullptr; // Sparse V input makes the full K index map unnecessary.
   int num_salient = static_cast<int>(idx_salient_row.numel());
 
   AT_DISPATCH_SWITCH(Q.scalar_type(), "attention_sparse_varlen", AT_DISPATCH_CASE(at::kBFloat16, [&] {
@@ -63,7 +59,7 @@ at::Tensor attention_sparse_varlen_cuda(const at::Tensor& Q, // [T_q, H, D], bf1
                            Q.data_ptr<scalar_t>(), K.data_ptr<scalar_t>(), V.data_ptr<scalar_t>(),
                            C.data_ptr<scalar_t>(), o_sal.data_ptr<scalar_t>(), Oc.data_ptr<scalar_t>(), B, H, H_kv,
                            cu_q_ptr, cu_k_ptr, max_seqlen_q, max_seqlen_k, total_seqlen, num_salient, cu_sal_ptr,
-                           idx_sal_ptr, idx_sal_q_ptr, block_mask_ptr, idx_map_k_ptr, idx_map_q_ptr, cosine_stats_ptr,
+                           idx_sal_ptr, idx_sal_q_ptr, row_masks_ptr, idx_map_k_ptr, idx_map_q_ptr, cosine_stats_ptr,
                            cosine_out_ptr, threshold, static_cast<int>(Q.size(2)));
                      }));
 

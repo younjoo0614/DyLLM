@@ -53,6 +53,60 @@ void compute_cosine_similarity(const float* stats, bool* out, const int total_to
   cosine_similarity_reduce_kernel<<<blocks, threads, 0>>>(stats, out, total_tokens, cu_seqlens_q, threshold);
 }
 
+__global__ void overwrite_salient_kernel(const nv_bfloat16* __restrict__ c,
+                                          const nv_bfloat16* __restrict__ o_sal,
+                                          nv_bfloat16* __restrict__ o,
+                                          const int* __restrict__ idx_salient_row,
+                                          float* __restrict__ cosine_stats, const int vector_size) {
+  const int salient_idx = blockIdx.x;
+  const int token_idx = idx_salient_row[salient_idx];
+  const int pair_count = vector_size / 2;
+  const nv_bfloat162* old_row = reinterpret_cast<const nv_bfloat162*>(c + token_idx * vector_size);
+  const nv_bfloat162* new_row = reinterpret_cast<const nv_bfloat162*>(o_sal + salient_idx * vector_size);
+  nv_bfloat162* out_row = reinterpret_cast<nv_bfloat162*>(o + token_idx * vector_size);
+
+  float3 local = {0.0f, 0.0f, 0.0f};
+  for (int pair = threadIdx.x; pair < pair_count; pair += blockDim.x) {
+    const nv_bfloat162 old_v = old_row[pair];
+    const nv_bfloat162 new_v = new_row[pair];
+    out_row[pair] = new_v;
+    const float2 old_f = __bfloat1622float2(old_v);
+    const float2 new_f = __bfloat1622float2(new_v);
+    local.x += new_f.x * old_f.x + new_f.y * old_f.y;
+    local.y += new_f.x * new_f.x + new_f.y * new_f.y;
+    local.z += old_f.x * old_f.x + old_f.y * old_f.y;
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local.x += __shfl_down_sync(0xffffffff, local.x, offset);
+    local.y += __shfl_down_sync(0xffffffff, local.y, offset);
+    local.z += __shfl_down_sync(0xffffffff, local.z, offset);
+  }
+
+  __shared__ float3 warp_stats[8];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0)
+    warp_stats[warp] = local;
+  __syncthreads();
+
+  if (warp == 0) {
+    local = lane < blockDim.x / 32 ? warp_stats[lane] : make_float3(0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local.x += __shfl_down_sync(0xffffffff, local.x, offset);
+      local.y += __shfl_down_sync(0xffffffff, local.y, offset);
+      local.z += __shfl_down_sync(0xffffffff, local.z, offset);
+    }
+    if (lane == 0) {
+      cosine_stats[token_idx * 3 + 0] = local.x;
+      cosine_stats[token_idx * 3 + 1] = local.y;
+      cosine_stats[token_idx * 3 + 2] = local.z;
+    }
+  }
+}
+
 __global__ void scatter_idx_map_kernel(const int* idx_salient_row, const int* cu_salientlens,
                                        const int* cu_seqlen_to_use, int* idx_map, const int num_salient,
                                        const int batch_size, const int max_seqlen_padded) {
@@ -105,26 +159,53 @@ __global__ void compute_block_mask_kernel(const int* idx_map, bool* block_mask, 
   block_mask[idx] = exists;
 }
 
+__global__ void compute_k_block_mask_kernel(const int* __restrict__ idx_salient_row,
+                                            const int* __restrict__ cu_salientlens,
+                                            const int* __restrict__ cu_seqlens_k, uint64_t* __restrict__ row_masks,
+                                            const int total_blocks, const int num_blk_k, const int block_k) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_blocks)
+    return;
+
+  const int batch_id = idx / num_blk_k;
+  const int block_id = idx - batch_id * num_blk_k;
+  const int seq_start = cu_seqlens_k[batch_id];
+  const int seq_end = cu_seqlens_k[batch_id + 1];
+  const int block_start = seq_start + block_id * block_k;
+  if (block_start >= seq_end) {
+    row_masks[idx] = 0;
+    return;
+  }
+  const int block_end = min(block_start + block_k, seq_end);
+
+  int left = cu_salientlens[batch_id];
+  int right = cu_salientlens[batch_id + 1];
+  while (left < right) {
+    const int mid = (left + right) >> 1;
+    if (idx_salient_row[mid] < block_start)
+      left = mid + 1;
+    else
+      right = mid;
+  }
+  uint64_t mask = 0;
+  const int salient_end = cu_salientlens[batch_id + 1];
+  while (left < salient_end && idx_salient_row[left] < block_end) {
+    mask |= 1ULL << (idx_salient_row[left] - block_start);
+    ++left;
+  }
+  row_masks[idx] = mask;
+}
+
 void compute_k_masks(const int batch_size, const int* cu_seqlens_k, const int* cu_salientlens_k,
                      const int* idx_salient_row_k, const int num_salient_k, const int BLOCK_K, const int max_seqlen_k,
-                     bool* block_mask, int* idx_map_k) {
+                     uint64_t* row_masks, int* idx_map_k) {
 
   int num_blk_k = (max_seqlen_k + BLOCK_K - 1) / BLOCK_K;
-  int max_seqlen_k_padded = num_blk_k * BLOCK_K;
-
-  if (num_salient_k > 0) {
-    int threads = 256;
-    int blocks = (num_salient_k + threads - 1) / threads;
-
-    scatter_idx_map_kernel<<<blocks, threads>>>(idx_salient_row_k, cu_salientlens_k, cu_seqlens_k, idx_map_k,
-                                                num_salient_k, batch_size, max_seqlen_k_padded);
-  }
-
-  size_t total_blocks = batch_size * num_blk_k;
-  int threads_bm = 256;
-  int blocks_bm = (total_blocks + threads_bm - 1) / threads_bm;
-
-  compute_block_mask_kernel<<<blocks_bm, threads_bm>>>(idx_map_k, block_mask, total_blocks, BLOCK_K);
+  const int total_blocks = batch_size * num_blk_k;
+  constexpr int threads = 256;
+  const int blocks = cdiv(total_blocks, threads);
+  compute_k_block_mask_kernel<<<blocks, threads>>>(idx_salient_row_k, cu_salientlens_k, cu_seqlens_k, row_masks,
+                                                   total_blocks, num_blk_k, BLOCK_K);
 }
 
 void compute_q_idx_map(const int batch_size, const int* cu_seqlens_q, const int* cu_salientlens_q,
@@ -143,7 +224,7 @@ void compute_q_idx_map(const int batch_size, const int* cu_seqlens_q, const int*
   }
 }
 
-template <int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
+template <int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, bool MASK_V_ROWS>
 __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
     void attention_sparse_varlen_kernel(const nv_bfloat16* Q,     // [sum(len_q), H_q, D]
                                         const nv_bfloat16* K,     // [sum(len_kv), H_kv, D]
@@ -153,7 +234,7 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
                                         nv_bfloat16* O,           // [sum(len_q), H_q, D]
                                         const int B, const int H, const int H_kv, const int* cu_seqlens_q,
                                         const int* cu_seqlens_k, const int max_seqlen_q, const int max_seqlen_k,
-                                        const int* cu_salientlens, const bool* block_mask, const int* idx_map_k,
+                                        const int* cu_salientlens, const uint64_t* row_masks, const int* idx_map_k,
                                         const int* idx_map_q, float* cosine_stats) {
 
   constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
@@ -177,11 +258,7 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
 
   const int num_kv_iter = cdiv(binfo.seqlen_kv, BLOCK_KV);
 
-  const int max_seqlen_k_padded = num_blk_kv * BLOCK_KV;
-  const int max_seqlen_q_padded = num_blk_q * BLOCK_Q;
-  const bool* block_mask_batch = block_mask + batch_id * num_blk_kv;
-  const int* idx_map_k_batch = idx_map_k + batch_id * max_seqlen_k_padded;
-  const int* idx_map_q_batch = idx_map_q + batch_id * max_seqlen_q_padded;
+  const uint64_t* row_masks_batch = row_masks + batch_id * num_blk_kv;
 
   const int ldg_q = H * DIM;     // Q, C, O use num_q_heads
   const int ldg_kv = H_kv * DIM; // K, V use num_kv_heads
@@ -282,7 +359,7 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
   // before finishing loading Q shared->reg
   __syncthreads();
 
-  auto load_KV = [&](int kv_id) {
+  auto load_KV = [&](int kv_id, uint64_t row_mask) {
     if (kv_id < num_kv_iter) {
       // Load K
       const uint32_t dst_k = K_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
@@ -290,31 +367,40 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
       global_to_shared_swizzle_zero_pad<BLOCK_KV, DIM, TB_SIZE>(dst_k, src_k, ldg_kv, tid, kv_id, 0, binfo.seqlen_kv);
 
       // Load V
-      if (block_mask_batch[kv_id]) {
+      if (row_mask != 0) {
         const uint32_t dst_v = V_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(nv_bfloat16));
         const nv_bfloat16* src_v = V + kv_id * BLOCK_KV * ldg_kv;
-        global_to_shared_swizzle_zero_pad_with_mask<BLOCK_KV, DIM, TB_SIZE>(dst_v, src_v, ldg_kv, tid, kv_id, 0,
-                                                                            binfo.seqlen_kv, idx_map_k_batch);
+        if constexpr (MASK_V_ROWS) {
+          global_to_shared_swizzle_zero_pad_with_row_mask<BLOCK_KV, DIM, TB_SIZE>(
+              dst_v, src_v, ldg_kv, tid, kv_id, 0, binfo.seqlen_kv, row_mask);
+        } else {
+          // V is already a sparse delta tensor, so a direct tile copy is exact.
+          global_to_shared_swizzle_zero_pad<BLOCK_KV, DIM, TB_SIZE>(dst_v, src_v, ldg_kv, tid, kv_id, 0,
+                                                                    binfo.seqlen_kv);
+        }
       }
     }
     asm volatile("cp.async.commit_group;");
   };
 
   // prefetch K and V
-  load_KV(0);
+  uint64_t current_row_mask = num_kv_iter > 0 ? row_masks_batch[0] : 0;
+  load_KV(0, current_row_mask);
 
   // sparse attention
   // full attention
   float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
     // Issue next block
-    load_KV(kv_id + 1);
+    const uint64_t next_row_mask = kv_id + 1 < num_kv_iter ? row_masks_batch[kv_id + 1] : 0;
+    load_KV(kv_id + 1, next_row_mask);
 
     // Wait for current block
     asm volatile("cp.async.wait_group 1;");
     __syncthreads();
 
-    bool sparse_block = !block_mask_batch[kv_id];
+    const bool sparse_block = current_row_mask == 0;
+    current_row_mask = next_row_mask;
     // bool sparse_block = false; // for debugging
 
     // K shared -> registers
@@ -334,9 +420,24 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
 
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
       // apply softmax scale
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
         for (int reg_id = 0; reg_id < 4; reg_id++)
           S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
+
+        // K is zero-padded in shared memory, but padded logits must not
+        // participate in the softmax denominator. Each lane owns two adjacent
+        // columns for each of its two MMA output rows.
+        float* regs = S_rmem[mma_id_q][mma_id_kv];
+        const int key_col = kv_id * BLOCK_KV + mma_id_kv * MMA_N + (lane_id % 4) * 2;
+        if (key_col >= binfo.seqlen_kv) {
+          regs[0] = -FLT_MAX;
+          regs[2] = -FLT_MAX;
+        }
+        if (key_col + 1 >= binfo.seqlen_kv) {
+          regs[1] = -FLT_MAX;
+          regs[3] = -FLT_MAX;
+        }
+      }
 
       // rowmax
       float this_rowmax[2];
@@ -434,15 +535,19 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
 
   // write to O
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+    const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+    const int global_row_0 = binfo.cu_seqlens_q_curr + blk_q_id * BLOCK_Q + row;
+    if (global_row_0 >= binfo.cu_seqlens_q_next)
+      continue;
+
+    const bool valid_1 = global_row_0 + 8 < binfo.cu_seqlens_q_next;
+    const float inv_rowsum_0 = __frcp_rn(rowsumexp[mma_id_q][0]);
+    const float inv_rowsum_1 = valid_1 ? __frcp_rn(rowsumexp[mma_id_q][1]) : 0.0f;
+
     float3 stats_0 = {0.0f, 0.0f, 0.0f};
     float3 stats_1 = {0.0f, 0.0f, 0.0f};
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
-      const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
       const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-
-      if (batch_offset_q + block_offset_q + row * ldg_q >= binfo.cu_seqlens_q_next * ldg_q)
-        continue;
-      bool valid_1 = (batch_offset_q + block_offset_q + (row + 8) * ldg_q < binfo.cu_seqlens_q_next * ldg_q);
 
       nv_bfloat162 old_c_0, old_c_1, new_c_0, new_c_1;
       float2 old_c_0_f2, old_c_1_f2, new_c_0_f2, new_c_1_f2;
@@ -454,39 +559,21 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
         old_c_1_f2 = __bfloat1622float2(old_c_1);
       }
 
-      int seq_row = blk_q_id * BLOCK_Q + row;
       float* regs = O_rmem[mma_id_q][mma_id_d];
 
-      // Handle first vector (row)
-      int idx_mapped_1, idx_mapped_2;
-      // prefer Q-side mapping for indexing O_sal (when q was pruned and has its own salient mapping)
-      idx_mapped_1 = idx_map_q_batch[seq_row];
-      if (idx_mapped_1 == -1) {
-        regs[0] /= rowsumexp[mma_id_q][0];
-        regs[1] /= rowsumexp[mma_id_q][0];
-        // c cache + c delta
-        new_c_0_f2 = {old_c_0_f2.x + regs[0], old_c_0_f2.y + regs[1]};
-        new_c_0 = __float22bfloat162_rn(new_c_0_f2);
-      } else {
-        // load o_sal
-        new_c_0 = reinterpret_cast<const nv_bfloat162*>(O_sal + idx_mapped_1 * ldg_q + col)[0];
-        new_c_0_f2 = __bfloat1622float2(new_c_0);
-      }
+      // Compute the sparse delta for every row. Salient rows are overwritten
+      // in one compact post-kernel after all head CTAs complete.
+      regs[0] *= inv_rowsum_0;
+      regs[1] *= inv_rowsum_0;
+      new_c_0_f2 = {old_c_0_f2.x + regs[0], old_c_0_f2.y + regs[1]};
+      new_c_0 = __float22bfloat162_rn(new_c_0_f2);
 
       // Handle second vector (row + 8)
       if (valid_1) {
-        idx_mapped_2 = idx_map_q_batch[seq_row + 8];
-        if (idx_mapped_2 == -1) {
-          regs[2] /= rowsumexp[mma_id_q][1];
-          regs[3] /= rowsumexp[mma_id_q][1];
-          // c cache + c delta
-          new_c_1_f2 = {old_c_1_f2.x + regs[2], old_c_1_f2.y + regs[3]};
-          new_c_1 = __float22bfloat162_rn(new_c_1_f2);
-        } else {
-          // load o_sal
-          new_c_1 = reinterpret_cast<const nv_bfloat162*>(O_sal + idx_mapped_2 * ldg_q + col)[0];
-          new_c_1_f2 = __bfloat1622float2(new_c_1);
-        }
+        regs[2] *= inv_rowsum_1;
+        regs[3] *= inv_rowsum_1;
+        new_c_1_f2 = {old_c_1_f2.x + regs[2], old_c_1_f2.y + regs[3]};
+        new_c_1 = __float22bfloat162_rn(new_c_1_f2);
       }
 
       stats_0.x += new_c_0_f2.x * old_c_0_f2.x + new_c_0_f2.y * old_c_0_f2.y;
@@ -520,8 +607,7 @@ __launch_bounds__(NUM_WARPS* WARP_SIZE) __global__
 
     // reduce among thread blocks and store to global memory
     if (lane_id % 4 == 0) {
-      const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
-      int global_token_idx_0 = binfo.cu_seqlens_q_curr + blk_q_id * BLOCK_Q + row;
+      int global_token_idx_0 = global_row_0;
 
       if (global_token_idx_0 < binfo.cu_seqlens_q_next) {
         atomicAdd(&cosine_stats[global_token_idx_0 * 3 + 0], stats_0.x);
@@ -549,7 +635,7 @@ void attention_sparse_varlen(const scalar_t* q,     // [sum(len_q), H_q, D]
                              const int B, const int H, const int H_kv, const int* cu_seqlens_q, const int* cu_seqlens_k,
                              const int max_seqlen_q, const int max_seqlen_k, const int total_seqlen_q,
                              const int num_salient, const int* cu_salientlens, const int* idx_salient_row_k,
-                             const int* idx_salient_row_q, bool* block_mask, int* idx_map_k, int* idx_map_q,
+                             const int* idx_salient_row_q, uint64_t* row_masks, int* idx_map_k, int* idx_map_q,
                              float* cosine_stats, // [sum(len_q), 3] - intermediate buffer, must be zero-initialized
                              bool* cosine_out,    // [sum(len_q)] - output bool mask (true if cos_sim < threshold)
                              float threshold, int dim) {
@@ -574,25 +660,37 @@ void attention_sparse_varlen(const scalar_t* q,     // [sum(len_q), H_q, D]
   const int num_blocks = B * H * cdiv(max_seqlen_q, BLOCK_Q);
   const int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
-  compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, num_salient, BLOCK_KV, max_seqlen_k, block_mask,
+  compute_k_masks(B, cu_seqlens_k, cu_salientlens, idx_salient_row_k, num_salient, BLOCK_KV, max_seqlen_k, row_masks,
                   idx_map_k);
-
-  compute_q_idx_map(B, cu_seqlens_q, cu_salientlens, idx_salient_row_q, num_salient, BLOCK_Q, max_seqlen_q, idx_map_q);
 
   auto launch_kernel_fn = [&](auto kernel, int dim_val) {
     const int smem_size = max(BLOCK_Q, BLOCK_KV * 4) * dim_val * sizeof(nv_bfloat16);
     launch_kernel(kernel, num_blocks, TB_SIZE, smem_size, q_ptr, k_ptr, v_ptr, c_ptr, o_sal_ptr, o_ptr, B, H, H_kv,
-                  cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, cu_salientlens, block_mask, idx_map_k,
+                  cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, cu_salientlens, row_masks, idx_map_k,
                   idx_map_q, cosine_stats);
   };
 
+  // On H100, masked zero-fill wins for short grids where K/V bandwidth and
+  // launch underfill dominate; direct copies have lower instruction overhead
+  // once there are enough CTAs to saturate the GPU.
+  const bool mask_v_rows = num_blocks <= 1024;
   if (dim == 64) {
-    launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 64, NUM_WARPS>, 64);
+    if (mask_v_rows)
+      launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 64, NUM_WARPS, true>, 64);
+    else
+      launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 64, NUM_WARPS, false>, 64);
   } else if (dim == 128) {
-    launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 128, NUM_WARPS>, 128);
+    if (mask_v_rows)
+      launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 128, NUM_WARPS, true>, 128);
+    else
+      launch_kernel_fn(attention_sparse_varlen_kernel<BLOCK_Q, BLOCK_KV, 128, NUM_WARPS, false>, 128);
   } else {
     std::cerr << "Unsupported dim=" << dim << std::endl;
     exit(1);
+  }
+
+  if (num_salient > 0) {
+    overwrite_salient_kernel<<<num_salient, 256>>>(c_ptr, o_sal_ptr, o_ptr, idx_salient_row_q, cosine_stats, H * dim);
   }
 
   compute_cosine_similarity(cosine_stats, cosine_out, total_seqlen_q, cu_seqlens_q, threshold);
@@ -604,7 +702,8 @@ template void attention_sparse_varlen<at::BFloat16>(
     const at::BFloat16* o_sal, at::BFloat16* o, const int B, const int H, const int H_kv, const int* cu_seqlens_q,
     const int* cu_seqlens_k, const int max_seqlen_q, const int max_seqlen_k, const int total_seqlen_q,
     const int num_salient, const int* cu_salientlens, const int* idx_salient_row_k, const int* idx_salient_row_q,
-    bool* block_mask, int* idx_map_k, int* idx_map_q, float* cosine_stats, bool* cosine_out, float threshold, int dim);
+    uint64_t* row_masks, int* idx_map_k, int* idx_map_q, float* cosine_stats, bool* cosine_out, float threshold,
+    int dim);
 
 __global__ void fused_offset_kernel(const int* idxs, const int* num_idxs_ptr, const int* cu_promptlens,
                                     const int* cu_salientlens, const int num_groups, long* out_tensor) {
